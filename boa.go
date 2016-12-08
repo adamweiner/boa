@@ -278,6 +278,7 @@ func Stalk() {
 		os.Mkdir("files/converted-320/"+fileSplit[1], os.ModePerm)
 		os.Mkdir("files/stream/"+fileSplit[1], os.ModePerm)
 		huntChan <- Message{Delivery: d, ID: id, StreamOnly: streamOnly, Filename: fileSplit[1] + "/" + fileSplit[2]}
+		msgJson.Free()
 	}
 }
 
