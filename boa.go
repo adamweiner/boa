@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"sync"
 
 	"github.com/jeffail/gabs"   // Dynamic JSON helper
 	"github.com/streadway/amqp" // RabbitMQ
@@ -40,7 +39,6 @@ var (
 		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 	}
 	awsRegion       = aws.USWest2 // Oregon
-	wait            sync.WaitGroup
 	huntChan        chan Message
 	constrictChan   chan Message
 	digestChan      chan Message
@@ -91,7 +89,6 @@ func main() {
 
 	// Create parellel goroutines for each task
 	for i := 0; i < maxParallelism(); i++ {
-		wait.Add(3)
 		go Hunt()
 		go Constrict()
 		go Digest()
@@ -99,8 +96,6 @@ func main() {
 
 	// Start stalking prey
 	Stalk()
-	fmt.Println("here")
-	wait.Wait()
 }
 
 // Get messages from Rabbit and pass them to Hunt()
@@ -186,13 +181,10 @@ func Stalk() {
 		os.Mkdir("files/stream/"+fileSplit[4], os.ModePerm)
 		huntChan <- Message{Delivery: d, ID: id, StreamOnly: streamOnly, Filename: fileSplit[4] + "/" + fileSplit[5]}
 	}
-
 }
 
 // Download original uploads from AWS and pass to Constrict()
 func Hunt() {
-	defer wait.Done()
-
 	for {
 		msg := <-huntChan
 		filename := msg.Filename
@@ -233,8 +225,6 @@ func Hunt() {
 
 // Compresses file and passes to Digest()
 func Constrict() {
-	defer wait.Done()
-
 	for {
 		msg := <-constrictChan
 		filename := msg.Filename
@@ -363,8 +353,6 @@ func CompressLame(sourceName string, outputPath string, stream bool) (err error)
 
 // Upload newly compressed file to AWS and delete local files
 func Digest() {
-	defer wait.Done()
-
 	// Connect to S3
 	connection := s3.New(awsAuth, awsRegion)
 	bucket, err := connection.Bucket("skyris-audio")
