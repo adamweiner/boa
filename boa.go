@@ -462,16 +462,14 @@ func Digest() {
 			log.Printf("--- UPLOAD " + path)
 
 			// Update newly uploaded path in mongo
-			var record interface{}
 			pathSplit := strings.Split(path, "/")
 			url := bucket.URL(path)
 			if len(url) > 0 {
 				_, err = audioCollection.Find(bson.M{"_id": bson.ObjectIdHex(msg.ID)}).Apply(
 					mgo.Change{
-						Update:    bson.M{"$set": bson.M{pathSplit[0] + "AwsPath": url}},
-						Upsert:    true,
-						ReturnNew: true,
-					}, &record)
+						Update: bson.M{"$set": bson.M{pathSplit[0]: url}},
+						Upsert: true,
+					}, nil)
 				if err != nil {
 					log.Fatal("!!! FATAL Cannot update " + msg.ID + " in Mongo:" + err.Error())
 				}
