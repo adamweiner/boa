@@ -16,16 +16,16 @@ It works in a few vaguely snakelike stages:
 Expects input as a JSON blob in the following format. The `id` is used in the S3 path to avoid issues with different audio files that have the same name.
 ```
 {
-  "id":"56773ff9faa58b662fc7cbb0",
-  "originalUploadPath":"original-upload/56773ff9faa58b662fc7cbb0/Snake-Boy.wav",
-  "streamOnly":true
+  "id": "56773ff9faa58b662fc7cbb0",
+  "originalUploadPath": "original-upload/56773ff9faa58b662fc7cbb0/Snake-Boy.wav",
+  "streamOnly": true
 }
 ```
 
 ## To Do:
 
-0. CLI config
-1. Clean up error handling
+0. Input validation
+1. Clean up error handling - better logging, set failure flag in Mongo if necessary
 2. Add support for other messaging queues and storage (MongoDB & RabbitMQ currently supported)
 3. Dockerize so installing the LAME dependency isn't an issue
 4. Write tests, set up CI

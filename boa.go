@@ -15,6 +15,7 @@ import (
 
 	"github.com/jeffail/gabs"   // Dynamic JSON helper
 	"github.com/streadway/amqp" // RabbitMQ
+	"github.com/urfave/cli"     // CLI helper
 	"gopkg.in/amz.v3/aws"       // AWS library
 	"gopkg.in/amz.v3/s3"        // S3 library
 	"gopkg.in/mgo.v2"           // Mongo
@@ -25,15 +26,17 @@ const (
 	HUNT_BUFSIZE      = 1000
 	CONSTRICT_BUFSIZE = 1000
 	DIGEST_BUFSIZE    = 1000
-	RABBIT_DIAL       = "amqp://guest:guest@localhost:5672/"
-	MONGO_DIAL        = "mongodb://localhost/"
-	DB_NAME           = "boa-dev"
-	DB_COLLECTION     = "audio"
-	S3_BUCKET         = "skyris-audio"
-	MP3_COMMENT       = "Constricted by boa"
 )
 
 var (
+	// pseudo-consts set at runtime
+	RABBIT_DIAL   string
+	MONGO_DIAL    string
+	DB_NAME       string
+	DB_COLLECTION string
+	S3_BUCKET     string
+	MP3_COMMENT   string
+
 	awsAuth = aws.Auth{
 		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
 		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
@@ -97,6 +100,69 @@ func CompressLame(sourceName string, outputPath string, stream bool) (err error)
 }
 
 func main() {
+	app := cli.NewApp()
+	app.Version = "0.2.1"
+	app.Name = "boa"
+	app.Usage = "Friendly neighborhood snake-boy trained to compress audio uploaded to S3"
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "rabbitDial, rd",
+			Value:  "amqp://guest:guest@localhost:5672/",
+			Usage:  "RabbitMQ connection string",
+			EnvVar: "RABBIT_DIAL",
+		},
+		cli.StringFlag{
+			Name:   "mongoDial, md",
+			Value:  "mongodb://localhost/",
+			Usage:  "MongoDB connection string",
+			EnvVar: "MONGO_DIAL",
+		},
+		cli.StringFlag{
+			Name:   "dbName, db",
+			Value:  "boa-dev",
+			Usage:  "Name of database to connect to",
+			EnvVar: "DB_NAME",
+		},
+		cli.StringFlag{
+			Name:   "dbCollection, c",
+			Value:  "audio",
+			Usage:  "Name of database collection to use",
+			EnvVar: "DB_COLLECTION",
+		},
+		cli.StringFlag{
+			Name:   "s3Bucket, s",
+			Value:  "boa-audio",
+			Usage:  "S3 bucket which stores all uploaded audio files",
+			EnvVar: "S3_BUCKET",
+		},
+		cli.StringFlag{
+			Name:   "mp3Coment, mc",
+			Value:  "Constricted by boa",
+			Usage:  "Comment to include in MP3 metadata",
+			EnvVar: "MP3_COMMENT",
+		},
+	}
+
+	app.Commands = []cli.Command{
+		{
+			Name:  "run",
+			Usage: "./boa [options] run",
+			Action: func(c *cli.Context) {
+				RABBIT_DIAL = c.GlobalString("rabbitDial")
+				MONGO_DIAL = c.GlobalString("mongoDial")
+				DB_NAME = c.GlobalString("dbName")
+				DB_COLLECTION = c.GlobalString("dbCollection")
+				S3_BUCKET = c.GlobalString("s3Bucket")
+				MP3_COMMENT = c.GlobalString("mp3Comment")
+				start()
+			},
+		},
+	}
+
+	app.Run(os.Args)
+}
+
+func start() {
 	// Connect to Mongo
 	sess, err := mgo.Dial(MONGO_DIAL + DB_NAME)
 	if err != nil {
@@ -396,16 +462,19 @@ func Digest() {
 			log.Printf("--- UPLOAD " + path)
 
 			// Update newly uploaded path in mongo
-			pathSplit := strings.Split(path, "/")
 			var record interface{}
-			_, err := audioCollection.Find(bson.M{"_id": bson.ObjectIdHex(msg.ID)}).Apply(
-				mgo.Change{
-					Update:    bson.M{"$set": bson.M{pathSplit[0] + "AwsPath": url}},
-					Upsert:    true,
-					ReturnNew: true,
-				}, &record)
-			if err != nil {
-				log.Fatal("!!! FATAL Cannot update " + msg.ID + " in Mongo:" + err.Error())
+			pathSplit := strings.Split(path, "/")
+			url := bucket.URL(path)
+			if len(url) > 0 {
+				_, err = audioCollection.Find(bson.M{"_id": bson.ObjectIdHex(msg.ID)}).Apply(
+					mgo.Change{
+						Update:    bson.M{"$set": bson.M{pathSplit[0] + "AwsPath": url}},
+						Upsert:    true,
+						ReturnNew: true,
+					}, &record)
+				if err != nil {
+					log.Fatal("!!! FATAL Cannot update " + msg.ID + " in Mongo:" + err.Error())
+				}
 			}
 
 			// Remove uploaded file
