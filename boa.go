@@ -13,13 +13,13 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/jeffail/gabs"   // Dynamic JSON helper
-	"github.com/streadway/amqp" // RabbitMQ
-	"github.com/urfave/cli"     // CLI helper
-	"gopkg.in/amz.v3/aws"       // AWS library
-	"gopkg.in/amz.v3/s3"        // S3 library
-	"gopkg.in/mgo.v2"           // Mongo
-	"gopkg.in/mgo.v2/bson"      // Mongo BSON
+	rj "github.com/amosmzhang/rapidjson" // Faster JSON helper
+	"github.com/streadway/amqp"          // RabbitMQ
+	"github.com/urfave/cli"              // CLI helper
+	"gopkg.in/amz.v3/aws"                // AWS library
+	"gopkg.in/amz.v3/s3"                 // S3 library
+	"gopkg.in/mgo.v2"                    // Mongo
+	"gopkg.in/mgo.v2/bson"               // Mongo BSON
 )
 
 const (
@@ -101,7 +101,7 @@ func CompressLame(sourceName string, outputPath string, stream bool) (err error)
 
 func main() {
 	app := cli.NewApp()
-	app.Version = "0.2.1"
+	app.Version = "0.2.2"
 	app.Name = "boa"
 	app.Usage = "Friendly neighborhood snake-boy trained to compress audio uploaded to S3"
 	app.Flags = []cli.Flag{
@@ -252,24 +252,23 @@ func Stalk() {
 	// Wait on new messages to come in off queue
 	for d := range msgs {
 		fmt.Println(string(d.Body))
-		json, err := gabs.ParseJSON(d.Body)
+		msgJson, err := rj.NewParsedJson(d.Body)
 		if err != nil {
-			log.Printf("!!! ERROR " + err.Error())
+			log.Printf("!!! ERROR Cannot parse message: " + err.Error())
 			d.Ack(false)
 		}
-		path := json.Path("originalUploadPath").String()
-		if path == "{}" {
-			log.Printf("!!! ERROR " + err.Error())
+		msgJsonCt := msgJson.GetContainer()
+		path, _ := msgJsonCt.GetPathContainerOrNil("originalUploadPath").GetString()
+		if path == "" {
+			log.Printf("!!! ERROR Cannot parse message: originalUploadPath empty")
 			d.Ack(false)
 		}
-		id := json.Path("id").String()
-		id = strings.Replace(id, "\"", "", -1)
-		if id == "{}" {
-			log.Printf("!!! ERROR " + err.Error())
+		id, _ := msgJsonCt.GetPathContainerOrNil("id").GetString()
+		if id == "" {
+			log.Printf("!!! ERROR Cannot parse message: id empty")
 			d.Ack(false)
 		}
-
-		streamOnly := json.Path("streamOnly").Data().(bool)
+		streamOnly, _ := msgJsonCt.GetPathContainerOrNil("streamOnly").GetBool()
 		path = strings.Replace(path, "\"", "", -1)
 		path = strings.Replace(path, "\\u003c", "<", -1)
 		path = strings.Replace(path, "\\u003e", "<", -1)
