@@ -75,7 +75,7 @@ func rabbitError(err error, msg string) {
 }
 
 // Compresses to either MP3 128 or MP3 320 using lame
-func CompressLame(sourceName string, outputPath string, stream bool) (err error) {
+func CompressLame(sourceName string, outputPath string, stream bool) error {
 	var cmd *exec.Cmd
 	if stream { // MP3 128
 		cmd = exec.Command("lame", "-q", "0", "-b", "128", "--cbr", "--tc", MP3_COMMENT, "files/original-upload/"+sourceName, "files/"+outputPath, "--silent")
@@ -86,7 +86,7 @@ func CompressLame(sourceName string, outputPath string, stream bool) (err error)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	if err = cmd.Wait(); err != nil {
+	if err := cmd.Wait(); err != nil {
 		return err
 	}
 
