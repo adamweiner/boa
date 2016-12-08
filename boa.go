@@ -1,0 +1,431 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"sync"
+
+	"github.com/jeffail/gabs"   // Dynamic JSON helper
+	"github.com/streadway/amqp" // RabbitMQ
+	"gopkg.in/amz.v3/aws"       // AWS library
+	"gopkg.in/amz.v3/s3"        // S3 library
+	"gopkg.in/mgo.v2"           // Mongo
+	"gopkg.in/mgo.v2/bson"      // Mongo BSON
+)
+
+const (
+	HUNT_BUFSIZE      = 1000
+	CONSTRICT_BUFSIZE = 1000
+	DIGEST_BUFSIZE    = 1000
+	RABBIT_DIAL       = "amqp://guest:guest@localhost:5672/"
+	MONGO_DIAL        = "mongodb://localhost/"
+	DB_NAME           = "boa-dev"
+	DB_COLLECTION     = "audio"
+	S3_BUCKET         = "boa-audio"
+	MP3_COMMENT       = "Constricted by boa"
+)
+
+var (
+	awsAuth = aws.Auth{
+		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+	}
+	awsRegion       = aws.USWest2 // Oregon
+	wait            sync.WaitGroup
+	huntChan        chan Message
+	constrictChan   chan Message
+	digestChan      chan Message
+	audioCollection *mgo.Collection
+)
+
+// Message is passed from channel to channel to let boa work its magic
+type Message struct {
+	ID         string
+	Filename   string
+	StreamOnly bool
+	Delivery   amqp.Delivery
+}
+
+// Returns the maximum reasonable parallelism to use
+func maxParallelism() int {
+	maxProcs := runtime.GOMAXPROCS(0)
+	numCPU := runtime.NumCPU()
+	if maxProcs < numCPU {
+		return maxProcs
+	}
+	return numCPU
+}
+
+// Logs error and panics if we experience a fatal Rabbit issue
+func rabbitError(err error, msg string) {
+	if err != nil {
+		log.Fatal("!!! FATAL " + msg + ": " + err.Error())
+	}
+}
+
+func main() {
+	// Connect to Mongo
+	sess, err := mgo.Dial(MONGO_DIAL + DB_NAME)
+	if err != nil {
+		log.Fatal("!!! FATAL Could not connect to Mongo")
+	}
+	defer sess.Close()
+	sess.SetSafe(&mgo.Safe{})
+	audioCollection = sess.DB(DB_NAME).C(DB_COLLECTION)
+
+	huntChan = make(chan Message, HUNT_BUFSIZE)
+	constrictChan = make(chan Message, CONSTRICT_BUFSIZE)
+	digestChan = make(chan Message, DIGEST_BUFSIZE)
+	defer close(huntChan)
+	defer close(constrictChan)
+	defer close(digestChan)
+
+	// Create parellel goroutines for each task
+	for i := 0; i < maxParallelism(); i++ {
+		wait.Add(3)
+		go Hunt()
+		go Constrict()
+		go Digest()
+	}
+
+	// Start stalking prey
+	Stalk()
+	fmt.Println("here")
+	wait.Wait()
+}
+
+// Get messages from Rabbit and pass them to Hunt()
+func Stalk() {
+	// Setup and connect to Rabbit
+	conn, err := amqp.Dial(RABBIT_DIAL)
+	rabbitError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	rabbitError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	err = ch.ExchangeDeclare(
+		"amq.topic", // name
+		"topic",     // type
+		true,        // durable
+		false,       // auto-deleted
+		false,       // internal
+		false,       // no-wait
+		nil,         // arguments
+	)
+	rabbitError(err, "Failed to declare an exchange")
+
+	q, err := ch.QueueDeclare(
+		"boa-stalk", // name
+		true,        // durable
+		false,       // delete when used
+		false,       // exclusive
+		false,       // no-wait
+		nil,         // arguments
+	)
+	rabbitError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		false,  // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	rabbitError(err, "Failed to register a consumer")
+
+	err = ch.QueueBind(
+		q.Name,      // queue name
+		"audio",     // routing key
+		"amq.topic", // exchange
+		false,
+		nil,
+	)
+	rabbitError(err, "Failed to bind a queue")
+
+	// Wait on new messages to come in off queue
+	for d := range msgs {
+		fmt.Println(string(d.Body))
+		json, err := gabs.ParseJSON(d.Body)
+		if err != nil {
+			log.Printf("!!! ERROR " + err.Error())
+			d.Ack(false)
+		}
+		path := json.Path("originalUploadPath").String()
+		if path == "{}" {
+			log.Printf("!!! ERROR " + err.Error())
+			d.Ack(false)
+		}
+		id := json.Path("id").String()
+		id = strings.Replace(id, "\"", "", -1)
+		if id == "{}" {
+			log.Printf("!!! ERROR " + err.Error())
+			d.Ack(false)
+		}
+
+		streamOnly := json.Path("streamOnly").Data().(bool)
+		path = strings.Replace(path, "\"", "", -1)
+		path = strings.Replace(path, "\\u003c", "<", -1)
+		path = strings.Replace(path, "\\u003e", "<", -1)
+		path = strings.Replace(path, "\\u0026", "&", -1)
+		fileSplit := strings.Split(path, "/")
+		os.Mkdir("files/original-upload/"+fileSplit[4], os.ModePerm)
+		os.Mkdir("files/converted-320/"+fileSplit[4], os.ModePerm)
+		os.Mkdir("files/stream/"+fileSplit[4], os.ModePerm)
+		huntChan <- Message{Delivery: d, ID: id, StreamOnly: streamOnly, Filename: fileSplit[4] + "/" + fileSplit[5]}
+	}
+
+}
+
+// Download original uploads from AWS and pass to Constrict()
+func Hunt() {
+	defer wait.Done()
+
+	for {
+		msg := <-huntChan
+		filename := msg.Filename
+
+		// Connect to S3
+		connection := s3.New(awsAuth, awsRegion)
+		bucket, err := connection.Bucket(S3_BUCKET)
+		if err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		// Get file from S3 bucket
+		downloadBytes, err := bucket.Get("original-upload/" + filename)
+		if err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		// Create file locally
+		downloadFile, err := os.Create("files/original-upload/" + filename)
+		defer downloadFile.Close()
+		if err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+		downloadBuffer := bufio.NewWriter(downloadFile)
+		downloadBuffer.Write(downloadBytes)
+		io.Copy(downloadBuffer, downloadFile)
+		downloadBuffer.Flush()
+		log.Printf("--- DOWNLOAD " + filename)
+		constrictChan <- msg
+	}
+}
+
+// Compresses file and passes to Digest()
+func Constrict() {
+	defer wait.Done()
+
+	for {
+		msg := <-constrictChan
+		filename := msg.Filename
+
+		// Use "file" to determine codec type
+		cmdFile := exec.Command("file", "files/original-upload/"+filename)
+		stdout, err := cmdFile.StdoutPipe()
+		if err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+		if err = cmdFile.Start(); err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(stdout)
+		fileInfo := buf.String()
+		if err = cmdFile.Wait(); err != nil {
+			log.Printf("!!! ERROR ", err)
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		streamOnly := msg.StreamOnly
+		if strings.Contains(fileInfo, "MPEG ADTS, layer III") {
+			// Convert only for streaming if stream filesize is smaller than original filesize
+			streamOnly = true
+		} else if !strings.Contains(fileInfo, "WAVE audio") && !strings.Contains(fileInfo, "AIFF audio") {
+			// Unsupported codec
+			log.Printf("!!! ERROR Invalid codec detected: " + filename)
+			msg.Delivery.Ack(false)
+			// mongo invalid flag
+			if err = os.Remove("files/original-upload/" + filename); err != nil {
+				log.Printf("!!! ERROR Problem removing files/original-upload/" + filename)
+			}
+			continue
+		}
+
+		// Generate new file name - replace expension (if .wav or .aiff) or add .mp3
+		var mp3File string
+		if strings.HasSuffix(strings.ToLower(filename), ".wav") {
+			mp3File = filename[:strings.LastIndex(strings.ToLower(filename), ".wav")] + ".mp3"
+		} else if strings.HasSuffix(strings.ToLower(filename), ".aiff") {
+			mp3File = filename[:strings.LastIndex(strings.ToLower(filename), ".aiff")] + ".mp3"
+		} else if !strings.HasSuffix(strings.ToLower(filename), ".mp3") {
+			mp3File = filename + ".mp3"
+		} else {
+			mp3File = filename
+		}
+
+		// Convert to MP3 V2 - stream
+		if err := CompressLame(filename, "stream/"+mp3File, true); err != nil {
+			log.Printf("!!! ERROR ", err)
+		} else {
+			log.Printf("--- COMPRESS original-upload/" + filename + " > stream/" + mp3File)
+			// Only upload stream if smaller than originally uploaded mp3
+			if streamOnly {
+				streamSizeFile, _ := os.Open("files/stream/" + mp3File)
+				originalSizeFile, _ := os.Open("files/original-upload/" + filename)
+				defer streamSizeFile.Close()
+				defer originalSizeFile.Close()
+				streamSize, _ := streamSizeFile.Stat()
+				originalSize, _ := originalSizeFile.Stat()
+				if streamSize.Size() < originalSize.Size() {
+					msg.Filename = "stream/" + mp3File
+					digestChan <- msg
+				} else {
+					log.Printf("--- NO UPLOAD original upload smaller than stream")
+					msg.Delivery.Ack(false)
+					if err = os.Remove("files/stream/" + mp3File); err != nil {
+						log.Printf("!!! ERROR Problem removing files/stream/" + mp3File)
+					}
+					// tell mongo its over
+				}
+			} else {
+				msg.Filename = "stream/" + mp3File
+				digestChan <- msg
+			}
+		}
+
+		// Convert to MP3 320 if we started with lossless
+		if !streamOnly {
+			if err := CompressLame(filename, "converted-320/"+mp3File, false); err != nil {
+				log.Printf("!!! ERROR ", err)
+			} else {
+				log.Printf("--- COMPRESS original-upload/" + filename + " > converted-320/" + mp3File)
+				msg.Filename = "converted-320/" + mp3File
+				digestChan <- msg
+			}
+		}
+
+		// Remove uploaded file
+		if err = os.Remove("files/original-upload/" + filename); err != nil {
+			log.Printf("!!! ERROR Problem removing files/original-upload/" + filename)
+		}
+	}
+}
+
+// Compresses to either MP3 128 or MP3 320 using lame
+func CompressLame(sourceName string, outputPath string, stream bool) (err error) {
+	var cmd *exec.Cmd
+	if stream { // MP3 128
+		cmd = exec.Command("lame", "-q", "0", "-b", "128", "--cbr", "--tc", MP3_COMMENT, "files/original-upload/"+sourceName, "files/"+outputPath, "--silent")
+	} else { // MP3 320
+		cmd = exec.Command("lame", "-q", "0", "-b", "320", "--cbr", "--tc", MP3_COMMENT, "files/original-upload/"+sourceName, "files/"+outputPath, "--silent")
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if err = cmd.Wait(); err != nil {
+		return err
+	}
+
+	// Ensure file exists after successful conversion
+	if _, err := os.Stat("files/" + outputPath); err != nil {
+		if os.IsNotExist(err) {
+			return errors.New("MP3 Compression failed: " + outputPath)
+		}
+	}
+	return nil
+}
+
+// Upload newly compressed file to AWS and delete local files
+func Digest() {
+	defer wait.Done()
+
+	// Connect to S3
+	connection := s3.New(awsAuth, awsRegion)
+	bucket, err := connection.Bucket("skyris-audio")
+	if err != nil {
+		log.Printf("!!! ERROR ", err)
+	}
+	for {
+		msg := <-digestChan
+		path := msg.Filename
+
+		// Open file
+		file, err := os.Open("files/" + path)
+		defer file.Close()
+		if err != nil {
+			log.Printf("!!! ERROR " + err.Error())
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		// Get file size
+		fileInfo, _ := file.Stat()
+		var size int64 = fileInfo.Size()
+		bytes := make([]byte, size)
+
+		// Read file into buffer
+		buffer := bufio.NewReader(file)
+		_, err = buffer.Read(bytes)
+		if err != nil {
+			log.Printf("!!! ERROR " + err.Error())
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		// Upload to S3
+		filetype := http.DetectContentType(bytes)
+		err = bucket.Put(path, bytes, filetype, s3.PublicRead)
+		if err != nil {
+			log.Printf("!!! ERROR " + err.Error())
+			msg.Delivery.Nack(false, true)
+			continue
+		}
+
+		log.Printf("--- UPLOAD " + path)
+
+		// Update newly uploaded path in mongo
+		pathSplit := strings.Split(path, "/")
+		url := bucket.URL(path)
+		if len(url) > 0 {
+			err = audioCollection.Update(bson.M{"_id": bson.ObjectIdHex(msg.ID)}, bson.M{"$set": bson.M{pathSplit[0] + "AwsPath": url}})
+			if err != nil {
+				log.Fatal("!!! FATAL Cannot update " + msg.ID + " in Mongo:" + err.Error())
+			}
+		} else {
+			log.Printf("!!! ERROR URL invalid for story " + msg.ID)
+		}
+
+		// Remove uploaded file
+		if err = os.Remove("files/" + path); err != nil {
+			log.Printf("!!! ERROR Problem removing files/" + path)
+		}
+
+		msg.Delivery.Ack(false)
+	}
+}

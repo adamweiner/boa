@@ -1,0 +1,6 @@
+github.com/jeffail/gabs
+github.com/streadway/amqp
+gopkg.in/amz.v3/aws
+gopkg.in/amz.v3/s3
+gopkg.in/mgo.v2
+gopkg.in/mgo.v2/bson
