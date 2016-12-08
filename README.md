@@ -1,6 +1,6 @@
 # boa
 
-Boa was initially written as a service for [Skyris](https://skyris.co) that converted music uploaded to S3 into smaller streamable MP3s (128kbps), as well as converted lossless uploads to 320kbps MP3s to make them available for download if a user so desired. It depends on the [LAME](http://lame.sourceforge.net/) MP3 encoder. What you'll find here is a cleaned up, slightly more generalized version of this service.
+boa was initially written as a service for [Skyris](https://skyris.co) that converted music uploaded to S3 into smaller streamable MP3s (128kbps), as well as converted lossless uploads to 320kbps MP3s to make them available for download if a user so desired. It depends on the [LAME](http://lame.sourceforge.net/) MP3 encoder. What you'll find here is a cleaned up, slightly more generalized version of this service.
 
 It works in a few vaguely snakelike stages:
 
@@ -10,6 +10,17 @@ It works in a few vaguely snakelike stages:
 4. **Digest** - upload newly created files to S3, delete local copies
 
 ![snake-boy](https://i.imgur.com/gJj0HIS.gif)
+
+## Usage:
+
+Expects input as a JSON blob in the following format. The `id` is used in the S3 path to avoid issues with different audio files that have the same name.
+```
+{
+  "id":"56773ff9faa58b662fc7cbb0",
+  "originalUploadPath":"original-upload/56773ff9faa58b662fc7cbb0/Snake-Boy.wav",
+  "streamOnly":true
+}
+```
 
 ## To Do:
 
