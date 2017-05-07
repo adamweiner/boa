@@ -6,14 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
 	rj "github.com/amosmzhang/rapidjson" // Faster JSON helper
+	log "github.com/sirupsen/logrus"     // Logging library
 	"github.com/streadway/amqp"          // RabbitMQ
 	"github.com/urfave/cli"              // CLI helper
 	"gopkg.in/amz.v3/aws"                // AWS library
@@ -23,19 +24,20 @@ import (
 )
 
 const (
-	HUNT_BUFSIZE      = 1000
-	CONSTRICT_BUFSIZE = 1000
-	DIGEST_BUFSIZE    = 1000
+	HuntBufferSize      = 1000
+	ConstrictBufferSize = 1000
+	DigestBufferSize    = 1000
 )
 
 var (
 	// pseudo-consts set at runtime
-	RABBIT_DIAL   string
-	MONGO_DIAL    string
-	DB_NAME       string
-	DB_COLLECTION string
-	S3_BUCKET     string
-	MP3_COMMENT   string
+	BoaRoot      string
+	RabbitDial   string
+	MongoDial    string
+	DbName       string
+	DbCollection string
+	S3Bucket     string
+	MP3Comment   string
 
 	awsAuth = aws.Auth{
 		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
@@ -49,6 +51,8 @@ var (
 	audioCollection *mgo.Collection
 )
 
+// TODO: logrus, storage lib, msg lib, real aws package, docker, travis
+
 // Message is passed from channel to channel to let boa work its magic
 type Message struct {
 	ID         string
@@ -57,30 +61,22 @@ type Message struct {
 	Delivery   amqp.Delivery
 }
 
-// Returns the maximum reasonable parallelism to use
-func maxParallelism() int {
-	maxProcs := runtime.GOMAXPROCS(0)
-	numCPU := runtime.NumCPU()
-	if maxProcs < numCPU {
-		return maxProcs
-	}
-	return numCPU
-}
-
 // Logs error and panics if we experience a fatal Rabbit issue
 func rabbitError(err error, msg string) {
 	if err != nil {
-		log.Fatal("!!! FATAL " + msg + ": " + err.Error())
+		log.Fatal(msg + ": " + err.Error())
 	}
 }
 
-// Compresses to either MP3 128 or MP3 320 using lame
-func CompressLame(sourceName string, outputPath string, stream bool) error {
+// CompressLame compresses sourceFile to either MP3 128 or MP3 320 using lame.
+func CompressLame(sourceFile string, outputFile string, stream bool) error {
 	var cmd *exec.Cmd
 	if stream { // MP3 128
-		cmd = exec.Command("lame", "-q", "0", "-b", "128", "--cbr", "--tc", MP3_COMMENT, "files/original-upload/"+sourceName, "files/"+outputPath, "--silent")
+		cmd = exec.Command("lame", "-q", "0", "-b", "128", "--cbr", "--tc",
+			MP3Comment, sourceFile, outputFile, "--silent")
 	} else { // MP3 320
-		cmd = exec.Command("lame", "-q", "0", "-b", "320", "--cbr", "--tc", MP3_COMMENT, "files/original-upload/"+sourceName, "files/"+outputPath, "--silent")
+		cmd = exec.Command("lame", "-q", "0", "-b", "320", "--cbr", "--tc",
+			MP3Comment, sourceFile, outputFile, "--silent")
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -90,10 +86,10 @@ func CompressLame(sourceName string, outputPath string, stream bool) error {
 		return err
 	}
 
-	// Ensure file exists after successful conversion
-	if _, err := os.Stat("files/" + outputPath); err != nil {
+	// Confirm file exists after successful conversion
+	if _, err := os.Stat(BoaRoot + "files/" + outputFile); err != nil {
 		if os.IsNotExist(err) {
-			return errors.New("MP3 Compression failed: " + outputPath)
+			return errors.New("MP3 Compression failed: " + outputFile)
 		}
 	}
 	return nil
@@ -101,10 +97,16 @@ func CompressLame(sourceName string, outputPath string, stream bool) error {
 
 func main() {
 	app := cli.NewApp()
-	app.Version = "0.2.2"
+	app.Version = "0.3.0 (" + runtime.Version() + ")"
 	app.Name = "boa"
 	app.Usage = "Friendly neighborhood snake-boy trained to compress audio uploaded to S3"
 	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "boaRoot, br",
+			Value:  "",
+			Usage:  "Root directory for boa to save & create files - defaults to same directory as boa",
+			EnvVar: "BOA_ROOT",
+		},
 		cli.StringFlag{
 			Name:   "rabbitDial, rd",
 			Value:  "amqp://guest:guest@localhost:5672/",
@@ -121,7 +123,7 @@ func main() {
 			Name:   "dbName, db",
 			Value:  "boa-dev",
 			Usage:  "Name of database to connect to",
-			EnvVar: "DB_NAME",
+			EnvVar: "DB_NAme",
 		},
 		cli.StringFlag{
 			Name:   "dbCollection, c",
@@ -133,13 +135,13 @@ func main() {
 			Name:   "s3Bucket, s",
 			Value:  "boa-audio",
 			Usage:  "S3 bucket which stores all uploaded audio files",
-			EnvVar: "S3_BUCKET",
+			EnvVar: "S3_Bucket",
 		},
 		cli.StringFlag{
 			Name:   "mp3Coment, mc",
 			Value:  "Constricted by boa",
 			Usage:  "Comment to include in MP3 metadata",
-			EnvVar: "MP3_COMMENT",
+			EnvVar: "MP3_Comment",
 		},
 	}
 
@@ -148,12 +150,13 @@ func main() {
 			Name:  "run",
 			Usage: "./boa [options] run",
 			Action: func(c *cli.Context) {
-				RABBIT_DIAL = c.GlobalString("rabbitDial")
-				MONGO_DIAL = c.GlobalString("mongoDial")
-				DB_NAME = c.GlobalString("dbName")
-				DB_COLLECTION = c.GlobalString("dbCollection")
-				S3_BUCKET = c.GlobalString("s3Bucket")
-				MP3_COMMENT = c.GlobalString("mp3Comment")
+				BoaRoot = c.GlobalString("boaRoot")
+				RabbitDial = c.GlobalString("rabbitDial")
+				MongoDial = c.GlobalString("mongoDial")
+				DbName = c.GlobalString("dbName")
+				DbCollection = c.GlobalString("DbCollection")
+				S3Bucket = c.GlobalString("s3Bucket")
+				MP3Comment = c.GlobalString("mp3Comment")
 				start()
 			},
 		},
@@ -164,30 +167,30 @@ func main() {
 
 func start() {
 	// Connect to Mongo
-	sess, err := mgo.Dial(MONGO_DIAL + DB_NAME)
+	sess, err := mgo.Dial(MongoDial + DbName)
 	if err != nil {
-		log.Fatal("!!! FATAL Could not connect to Mongo")
+		log.Fatal("Could not connect to Mongo")
 	}
 	defer sess.Close()
 	sess.SetSafe(&mgo.Safe{})
-	audioCollection = sess.DB(DB_NAME).C(DB_COLLECTION)
+	audioCollection = sess.DB(DbName).C(DbCollection)
 
 	// Connect to S3
 	connection := s3.New(awsAuth, awsRegion)
-	bucket, err = connection.Bucket(S3_BUCKET)
+	bucket, err = connection.Bucket(S3Bucket)
 	if err != nil {
-		log.Fatal("!!! FATAL Could not connect to S3 bucket "+S3_BUCKET, err)
+		log.Fatal("Could not connect to S3 bucket "+S3Bucket, err)
 	}
 
-	huntChan = make(chan Message, HUNT_BUFSIZE)
-	constrictChan = make(chan Message, CONSTRICT_BUFSIZE)
-	digestChan = make(chan Message, DIGEST_BUFSIZE)
+	huntChan = make(chan Message, HuntBufferSize)
+	constrictChan = make(chan Message, ConstrictBufferSize)
+	digestChan = make(chan Message, DigestBufferSize)
 	defer close(huntChan)
 	defer close(constrictChan)
 	defer close(digestChan)
 
 	// Create parellel goroutines for each task
-	for i := 0; i < maxParallelism(); i++ {
+	for i := 0; i < runtime.NumCPU(); i++ {
 		go Hunt()
 		go Constrict()
 		go Digest()
@@ -200,7 +203,7 @@ func start() {
 // Get messages from Rabbit and pass them to Hunt()
 func Stalk() {
 	// Setup and connect to Rabbit
-	conn, err := amqp.Dial(RABBIT_DIAL)
+	conn, err := amqp.Dial(RabbitDial)
 	rabbitError(err, "Failed to connect to RabbitMQ")
 	defer conn.Close()
 
@@ -254,18 +257,18 @@ func Stalk() {
 		fmt.Println(string(d.Body))
 		msgJson, err := rj.NewParsedJson(d.Body)
 		if err != nil {
-			log.Printf("!!! ERROR Cannot parse message: " + err.Error())
+			log.Error("Cannot parse message: " + err.Error())
 			d.Ack(false)
 		}
 		msgJsonCt := msgJson.GetContainer()
 		path, _ := msgJsonCt.GetPathContainerOrNil("originalUploadPath").GetString()
 		if path == "" {
-			log.Printf("!!! ERROR Cannot parse message: originalUploadPath empty")
+			log.Error("Cannot parse message: originalUploadPath empty")
 			d.Ack(false)
 		}
 		id, _ := msgJsonCt.GetPathContainerOrNil("id").GetString()
 		if id == "" {
-			log.Printf("!!! ERROR Cannot parse message: id empty")
+			log.Error("Cannot parse message: id empty")
 			d.Ack(false)
 		}
 		streamOnly, _ := msgJsonCt.GetPathContainerOrNil("streamOnly").GetBool()
@@ -274,9 +277,9 @@ func Stalk() {
 		path = strings.Replace(path, "\\u003e", "<", -1)
 		path = strings.Replace(path, "\\u0026", "&", -1)
 		fileSplit := strings.Split(path, "/")
-		os.Mkdir("files/original-upload/"+fileSplit[1], os.ModePerm)
-		os.Mkdir("files/converted-320/"+fileSplit[1], os.ModePerm)
-		os.Mkdir("files/stream/"+fileSplit[1], os.ModePerm)
+		os.Mkdir(filepath.Join(BoaRoot, "files/original-upload/", fileSplit[1]), os.ModePerm)
+		os.Mkdir(filepath.Join(BoaRoot, "files/converted-320/", fileSplit[1]), os.ModePerm)
+		os.Mkdir(filepath.Join(BoaRoot, "files/stream/", fileSplit[1]), os.ModePerm)
 		huntChan <- Message{Delivery: d, ID: id, StreamOnly: streamOnly, Filename: fileSplit[1] + "/" + fileSplit[2]}
 		msgJson.Free()
 	}
@@ -292,16 +295,16 @@ func Hunt() {
 			// Get file from S3 bucket
 			downloadBytes, err := bucket.Get("original-upload/" + filename)
 			if err != nil {
-				log.Printf("!!! ERROR ", err, filename)
+				log.Error("Error fetching " + filename + ": " + err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
 
 			// Create file locally
-			downloadFile, err := os.Create("files/original-upload/" + filename)
+			downloadFile, err := os.Create(filepath.Join(BoaRoot, "files/original-upload/", filename))
 			defer downloadFile.Close()
 			if err != nil {
-				log.Printf("!!! ERROR ", err)
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
@@ -309,7 +312,7 @@ func Hunt() {
 			downloadBuffer.Write(downloadBytes)
 			io.Copy(downloadBuffer, downloadFile)
 			downloadBuffer.Flush()
-			log.Printf("--- DOWNLOAD " + filename)
+			log.Info("DOWNLOAD " + filename)
 			constrictChan <- msg
 		}
 	}
@@ -323,15 +326,15 @@ func Constrict() {
 			filename := msg.Filename
 
 			// Use "file" to determine codec type
-			cmdFile := exec.Command("file", "files/original-upload/"+filename)
+			cmdFile := exec.Command("file", filepath.Join(BoaRoot, "files/original-upload/", filename))
 			stdout, err := cmdFile.StdoutPipe()
 			if err != nil {
-				log.Printf("!!! ERROR ", err)
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
 			if err = cmdFile.Start(); err != nil {
-				log.Printf("!!! ERROR ", err)
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
@@ -339,7 +342,7 @@ func Constrict() {
 			buf.ReadFrom(stdout)
 			fileInfo := buf.String()
 			if err = cmdFile.Wait(); err != nil {
-				log.Printf("!!! ERROR ", err)
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
@@ -350,11 +353,12 @@ func Constrict() {
 				streamOnly = true
 			} else if !strings.Contains(fileInfo, "WAVE audio") && !strings.Contains(fileInfo, "AIFF audio") {
 				// Unsupported codec
-				log.Printf("!!! ERROR Invalid codec detected: " + filename)
+				log.Error("Invalid codec detected: " + filename)
 				msg.Delivery.Ack(false)
 				// mongo invalid flag
-				if err = os.Remove("files/original-upload/" + filename); err != nil {
-					log.Printf("!!! ERROR Problem removing files/original-upload/" + filename)
+				path := filepath.Join(BoaRoot, "files/original-upload/", filename)
+				if err = os.Remove(path); err != nil {
+					log.Error("Problem removing " + path)
 				}
 				continue
 			}
@@ -372,14 +376,15 @@ func Constrict() {
 			}
 
 			// Convert to MP3 V2 - stream
-			if err := CompressLame(filename, "stream/"+mp3File, true); err != nil {
-				log.Printf("!!! ERROR ", err)
+			if err := CompressLame(filepath.Join(BoaRoot, "files/original-upload/", filename),
+				filepath.Join(BoaRoot, "stream/", mp3File), true); err != nil {
+				log.Error(err.Error())
 			} else {
-				log.Printf("--- COMPRESS original-upload/" + filename + " > stream/" + mp3File)
+				log.Info("COMPRESS original-upload/" + filename + " > stream/" + mp3File)
 				// Only upload stream if smaller than originally uploaded mp3
 				if streamOnly {
-					streamSizeFile, _ := os.Open("files/stream/" + mp3File)
-					originalSizeFile, _ := os.Open("files/original-upload/" + filename)
+					streamSizeFile, _ := os.Open(filepath.Join(BoaRoot, "files/stream/", mp3File))
+					originalSizeFile, _ := os.Open(filepath.Join(BoaRoot, "files/original-upload/", filename))
 					defer streamSizeFile.Close()
 					defer originalSizeFile.Close()
 					streamSize, _ := streamSizeFile.Stat()
@@ -388,10 +393,11 @@ func Constrict() {
 						msg.Filename = "stream/" + mp3File
 						digestChan <- msg
 					} else {
-						log.Printf("--- NO UPLOAD original upload smaller than stream")
+						log.Info("NO UPLOAD original upload smaller than stream")
 						msg.Delivery.Ack(false)
-						if err = os.Remove("files/stream/" + mp3File); err != nil {
-							log.Printf("!!! ERROR Problem removing files/stream/" + mp3File)
+						path := filepath.Join(BoaRoot, "files/stream/", mp3File)
+						if err = os.Remove(path); err != nil {
+							log.Error("Could not remove " + path)
 						}
 						// tell mongo its over
 					}
@@ -403,18 +409,20 @@ func Constrict() {
 
 			// Convert to MP3 320 if we started with lossless
 			if !streamOnly {
-				if err := CompressLame(filename, "converted-320/"+mp3File, false); err != nil {
-					log.Printf("!!! ERROR ", err)
+				if err := CompressLame(filepath.Join(BoaRoot, "files/original-upload/", filename),
+					filepath.Join(BoaRoot, "converted-320/", mp3File), false); err != nil {
+					log.Error(err.Error())
 				} else {
-					log.Printf("--- COMPRESS original-upload/" + filename + " > converted-320/" + mp3File)
+					log.Info("COMPRESS original-upload/" + filename + " > converted-320/" + mp3File)
 					msg.Filename = "converted-320/" + mp3File
 					digestChan <- msg
 				}
 			}
 
 			// Remove uploaded file
-			if err = os.Remove("files/original-upload/" + filename); err != nil {
-				log.Printf("!!! ERROR Problem removing files/original-upload/" + filename)
+			path := filepath.Join(BoaRoot, "files/original-upload/", filename)
+			if err = os.Remove(path); err != nil {
+				log.Error("Error removing " + path)
 			}
 		}
 	}
@@ -425,13 +433,13 @@ func Digest() {
 	for {
 		msg, ok := <-digestChan
 		if ok {
-			path := msg.Filename
+			filename := msg.Filename
 
 			// Open file
-			file, err := os.Open("files/" + path)
+			file, err := os.Open(filepath.Join(BoaRoot + "files/" + filename))
 			defer file.Close()
 			if err != nil {
-				log.Printf("!!! ERROR " + err.Error())
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
@@ -445,25 +453,25 @@ func Digest() {
 			buffer := bufio.NewReader(file)
 			_, err = buffer.Read(bytes)
 			if err != nil {
-				log.Printf("!!! ERROR " + err.Error())
+				log.Printf(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
 
 			// Upload to S3
 			filetype := http.DetectContentType(bytes)
-			err = bucket.Put(path, bytes, filetype, s3.PublicRead)
+			err = bucket.Put(filename, bytes, filetype, s3.PublicRead)
 			if err != nil {
-				log.Printf("!!! ERROR " + err.Error())
+				log.Error(err.Error())
 				msg.Delivery.Nack(false, true)
 				continue
 			}
 
-			log.Printf("--- UPLOAD " + path)
+			log.Info("UPLOAD " + filename)
 
 			// Update newly uploaded path in mongo
-			pathSplit := strings.Split(path, "/")
-			url := bucket.URL(path)
+			pathSplit := strings.Split(filename, "/")
+			url := bucket.URL(filename)
 			if len(url) > 0 {
 				_, err = audioCollection.Find(bson.M{"_id": bson.ObjectIdHex(msg.ID)}).Apply(
 					mgo.Change{
@@ -471,13 +479,14 @@ func Digest() {
 						Upsert: true,
 					}, nil)
 				if err != nil {
-					log.Fatal("!!! FATAL Cannot update " + msg.ID + " in Mongo:" + err.Error())
+					log.Fatal("Cannot update " + msg.ID + " in Mongo:" + err.Error())
 				}
 			}
 
 			// Remove uploaded file
-			if err = os.Remove("files/" + path); err != nil {
-				log.Printf("!!! ERROR Problem removing files/" + path)
+			path := filepath.Join(BoaRoot, "files/", filename)
+			if err = os.Remove(path); err != nil {
+				log.Error("Error removing " + path)
 			}
 
 			msg.Delivery.Ack(false)

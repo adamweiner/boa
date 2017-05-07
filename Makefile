@@ -1,12 +1,12 @@
-SHELL := /bin/bash
-PWD    = $(shell pwd)
+GO_BIN := $(GOPATH)/bin
+LIST_NO_VENDOR := $(go list ./... | grep -v /vendor/)
 
 .PHONY: %
 
-default: env fmt deps build lame
+default: env fmt deps lame build
 
 build:
-	GOPATH=$(PWD)/go/ go build -o boa boa.go
+	go build -a -o boa .
 
 clean:
 	go clean -i
@@ -14,11 +14,10 @@ clean:
 	rm -rf go/
 
 deps:
-	# Fetch Go deps using gpm
-	curl -s https://raw.githubusercontent.com/pote/gpm/master/bin/gpm > gpm.sh
-	chmod +x gpm.sh
-	GOPATH=$(PWD)/go/ ./gpm.sh
-	rm gpm.sh
+	# Install or update govend
+	go get -u github.com/govend/govend
+	# Fetch vendored dependencies
+	$(GO_BIN)/govend -v
 
 env:
 	mkdir -p files/stream && \
@@ -26,7 +25,12 @@ env:
 	mkdir -p files/original-upload
 
 fmt:
-	go fmt ./...
+	go fmt $(LIST_NO_VENDOR)
+
+generate-deps:
+	# Generate vendor.yml
+	govend -v -l
+	git checkout vendor/.gitignore
 
 lame:
 	# Check for lame
