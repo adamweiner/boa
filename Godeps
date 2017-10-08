@@ -1,7 +1,0 @@
-github.com/amosmzhang/rapidjson
-github.com/streadway/amqp
-github.com/urfave/cli
-gopkg.in/amz.v3/aws
-gopkg.in/amz.v3/s3
-gopkg.in/mgo.v2
-gopkg.in/mgo.v2/bson
